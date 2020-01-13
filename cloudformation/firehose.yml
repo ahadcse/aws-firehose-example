@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Firehose example
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Service:
+    Type: String
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref Service
+      VersioningConfiguration:
+        Status: Enabled
+
+  DeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+
+  DeliveryPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: firehose-delivery-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${S3Bucket}'
+              - !Sub 'arn:aws:s3:::${S3Bucket}*'
+      Roles:
+        - !Ref DeliveryRole
+
+  InvokeLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: firehose-lambda-policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource:
+              - !GetAtt ProcessLambdaFunction.Arn
+      Roles:
+        - !Ref DeliveryRole
+
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: FirehoseStreamingPlatform
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::${S3Bucket}'
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 50
+        CompressionFormat: UNCOMPRESSED
+        Prefix: firehose/
+        RoleARN: !GetAtt DeliveryRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt ProcessLambdaFunction.Arn
+              Type: Lambda
+
+  ProcessLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: allowLambdaLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+
+  ProcessLambdaFunction:
+    Type: AWS::Lambda::Function
+    Description: Data transformation lambda
+    Properties:
+      Code:
+        ZipFile: >
+          console.log('Transforming data')
+
+          exports.handler = function(event, context) {
+              console.log(JSON.stringify(event))
+              const records = []
+              for(let i = 0; i<event.records.length; i++) {
+                 let payload = Buffer.from(event.records[i].data, 'base64').toString('ascii')
+                 payload = JSON.parse(payload)
+                 payload.decoded = true
+                 records.push({
+                   recordId: event.records[i].recordId,
+                   result: 'Ok',
+                   data: Buffer.from(JSON.stringify(payload)).toString('base64')
+                 })
+              }
+              console.log(`Return: ${ JSON.stringify({ records }) }`)
+              return Promise.resolve({ records })
+          }
+      Handler: index.handler
+      Role: !GetAtt ProcessLambdaExecutionRole.Arn
+      Runtime: nodejs12.x
+      Timeout: 60
+      MemorySize: 128
+
+  Logger:
+    Type: AWS::Lambda::Function
+    Description: Creates a Record on the Delivery Stream
+    Properties:
+      Code:
+        ZipFile: >
+          console.log('Sending record to delivery stream')
+
+          exports.handler = async (event, context) => {
+              const AWS = require('aws-sdk')
+              AWS.config.apiVersions = {
+                kinesis: '2013-12-02'
+              }
+              const firehose = new AWS.Firehose({
+                region: "eu-west-1"
+              })
+              const params = {
+                Record: {
+                  Data: JSON.stringify(event)
+                },
+                DeliveryStreamName: 'FirehoseStreamingPlatform'
+              }
+              const data = await firehose.putRecord(params).promise()
+              console.log("Done: " + JSON.stringify(data))
+          }
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Timeout: 60
+      MemorySize: 128
+      Role:
+        Fn::GetAtt: [ StreamingPlatformWriter, Arn ]
+
+  StreamingPlatformWriter:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      RoleName: StreamingPlatformWriter
+      Policies:
+        - PolicyName: WriteToFirehoseStream
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'firehose:DeleteDeliveryStream'
+                  - 'firehose:PutRecord'
+                  - 'firehose:PutRecordBatch'
+                  - 'firehose:PutRecordBatch'
+                Resource:
+                  - Fn::GetAtt: [ DeliveryStream, Arn ]
+        - PolicyName: AWSLambdaBasicExecutionRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: "*"

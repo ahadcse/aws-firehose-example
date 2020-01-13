@@ -1,0 +1,10 @@
+{
+  "name": "aws-firehose-example",
+  "version": "1.0.0",
+  "description": "Firehose implementation",
+  "scripts": {
+    "test": "echo \\\"Error: no tests specified\\\" && exit 1"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
